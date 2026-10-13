@@ -2,6 +2,7 @@ import os
 import re
 import hashlib
 import base64
+import math
 from datetime import datetime, timezone
 
 import google.auth
@@ -9,8 +10,8 @@ import pandas as pd
 from googleapiclient.discovery import build
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
+from supabase import create_client, Client
 
-# UPDATED: Changed from spreadsheets.readonly to full spreadsheets access
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/cloud-platform",
@@ -107,12 +108,18 @@ def ensure_table_exists_and_schema(bq_client, table_id, schema):
         table = bigquery.Table(table_id, schema=schema)
         bq_client.create_table(table)
 
-def load_dataframe_to_bigquery(bq_client, df, project_id, dataset_id, table_name, schema, ad_type):
-    if df.empty:
-        return
-    table_id = f"{project_id}.{dataset_id}.{table_name}"
-    ensure_table_exists_and_schema(bq_client, table_id, schema)
+def get_sheet_id_by_name(sheets_service, spreadsheet_id, tab_name):
+    sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    for sheet in sheet_metadata.get('sheets', []):
+        if sheet['properties']['title'] == tab_name:
+            return sheet['properties']['sheetId']
+    raise ValueError(f"Tab '{tab_name}' not found.")
 
+def filter_dataframe_for_new_rows(bq_client, df, project_id, dataset_id, table_name, ad_type) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    table_id = f"{project_id}.{dataset_id}.{table_name}"
     df["_dedupe_key"] = df.apply(lambda row: make_current_duplicate_key(row, ad_type), axis=1)
     df = df[~df["_dedupe_key"].apply(lambda k: not any(str(v).strip() for v in k))].copy()
     df = df.drop_duplicates(subset=["_dedupe_key"]).copy()
@@ -122,8 +129,13 @@ def load_dataframe_to_bigquery(bq_client, df, project_id, dataset_id, table_name
         df = df[~df["_dedupe_key"].isin(existing_keys)].copy()
 
     df = df.drop(columns=["_dedupe_key"], errors="ignore")
+    return df
+
+def load_dataframe_to_bigquery(bq_client, df, project_id, dataset_id, table_name, schema):
     if df.empty:
         return
+    table_id = f"{project_id}.{dataset_id}.{table_name}"
+    ensure_table_exists_and_schema(bq_client, table_id, schema)
 
     job_config = bigquery.LoadJobConfig(
         schema=schema,
@@ -131,27 +143,47 @@ def load_dataframe_to_bigquery(bq_client, df, project_id, dataset_id, table_name
         create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
     )
     bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
-    print(f"Appended {len(df)} new rows into {table_id}")
+    print(f"Appended {len(df)} new rows into BigQuery table {table_id}")
 
-# NEW: Helper function to get the numeric Sheet ID needed for deletion
-def get_sheet_id_by_name(sheets_service, spreadsheet_id, tab_name):
-    sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    for sheet in sheet_metadata.get('sheets', []):
-        if sheet['properties']['title'] == tab_name:
-            return sheet['properties']['sheetId']
-    raise ValueError(f"Tab '{tab_name}' not found.")
+def load_dataframe_to_supabase(supabase_client: Client, df: pd.DataFrame, table_name: str):
+    if df.empty:
+        return
+        
+    df_clean = df.copy()
+    
+    # Format datetime for JSON/PostgreSQL
+    if '_loaded_at_utc' in df_clean.columns:
+        df_clean['_loaded_at_utc'] = df_clean['_loaded_at_utc'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        
+    # Handle NaNs and convert nullable types to Python natives
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'Int64':
+            df_clean[col] = df_clean[col].apply(lambda x: int(x) if pd.notnull(x) else None)
+        else:
+            df_clean[col] = df_clean[col].replace({float('nan'): None, pd.NA: None})
+
+    records = df_clean.to_dict(orient="records")
+    
+    try:
+        supabase_client.table(table_name).insert(records).execute()
+        print(f"Appended {len(records)} new rows into Supabase table {table_name}")
+    except Exception as e:
+        print(f"Error inserting into Supabase table {table_name}: {e}")
 
 def main():
     project_id = required_env("GCP_PROJECT_ID")
     dataset_id = required_env("BQ_DATASET")
     spreadsheet_id = required_env("SPREADSHEET_ID")
     tab_name = required_env("TAB_NAME")
+    
+    supabase_url = required_env("SUPABASE_URL")
+    supabase_key = required_env("SUPABASE_KEY")
+    supabase_client = create_client(supabase_url, supabase_key)
 
     credentials, _ = google.auth.default(scopes=SCOPES)
     sheets_service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
     bq_client = bigquery.Client(project=project_id, credentials=credentials)
 
-    # Read data from the single sheet
     response = sheets_service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab_name}'!A:ZZ"
@@ -207,8 +239,22 @@ def main():
         final_df["_source_row_number"] = pd.to_numeric(final_df["_source_row_number"], errors="coerce").astype("Int64")
         final_df["_loaded_at_utc"] = pd.to_datetime(final_df["_loaded_at_utc"], errors="coerce", utc=True)
 
+        # Extract only the genuinely new rows (using BigQuery as the source of truth for duplicates)
+        new_rows_df = filter_dataframe_for_new_rows(
+            bq_client=bq_client, 
+            df=final_df, 
+            project_id=project_id, 
+            dataset_id=dataset_id, 
+            table_name=table_name, 
+            ad_type=ad_type
+        )
+
+        if new_rows_df.empty:
+            print(f"No new rows to insert for {table_name}.")
+            continue
+
         schema = []
-        for col in final_df.columns:
+        for col in new_rows_df.columns:
             if col == "_loaded_at_utc":
                 schema.append(bigquery.SchemaField(col, "TIMESTAMP"))
             elif col == "_source_row_number":
@@ -216,22 +262,13 @@ def main():
             else:
                 schema.append(bigquery.SchemaField(col, "STRING"))
 
-        load_dataframe_to_bigquery(
-            bq_client=bq_client,
-            df=final_df,
-            project_id=project_id,
-            dataset_id=dataset_id,
-            table_name=table_name,
-            schema=schema,
-            ad_type=ad_type,
-        )
+        # Load identical datasets to both destinations
+        load_dataframe_to_bigquery(bq_client, new_rows_df, project_id, dataset_id, table_name, schema)
+        load_dataframe_to_supabase(supabase_client, new_rows_df, table_name)
 
-    # NEW: Delete the processed rows from the Google Sheet
-    print("All data successfully pushed to BigQuery. Deleting processed rows from the Google Sheet...")
+    print("Pipeline completion successful. Deleting processed rows from the Google Sheet...")
     sheet_id = get_sheet_id_by_name(sheets_service, spreadsheet_id, tab_name)
     
-    # We delete from index 1 (row 2) down to the exact number of rows we originally read
-    # This ensures we don't accidentally delete rows that were added while the script was running.
     delete_request = {
         "deleteDimension": {
             "range": {

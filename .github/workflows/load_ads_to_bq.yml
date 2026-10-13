@@ -1,0 +1,42 @@
+name: Ads Pipeline to BigQuery
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7,10 * * *'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Auth to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Mask Spreadsheet ID in logs
+        run: |
+          echo "::add-mask::${{ secrets.SPREADSHEET_ID }}"
+
+      - name: Run pipeline
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          TAB_NAME: ${{ secrets.TAB_NAME }}
+        run: python load_ads_to_bq.py

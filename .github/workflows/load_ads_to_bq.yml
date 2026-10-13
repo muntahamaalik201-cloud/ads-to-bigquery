@@ -1,8 +1,9 @@
-name: Ads Pipeline to BigQuery
+name: Ads Pipeline to BigQuery and Supabase
 
 on:
-  workflow_dispatch
-  
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7,10 * * *'
 
 jobs:
   run:
@@ -38,4 +39,6 @@ jobs:
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           TAB_NAME: ${{ secrets.TAB_NAME }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python load_ads_to_bq.py

@@ -10,8 +10,9 @@ from googleapiclient.discovery import build
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
 
+# UPDATED: Changed from spreadsheets.readonly to full spreadsheets access
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/cloud-platform",
 ]
 
@@ -39,7 +40,6 @@ def required_env(name: str) -> str:
     return value.strip()
 
 def hex_to_youtube_url(video_url: str) -> tuple[str, str]:
-    """Extracts hex ID from URL, converts to base64, and returns (youtube_url, hex_id)."""
     video_url = str(video_url or "").strip()
     match = re.search(r"([a-fA-F0-9]{16})", video_url)
     if not match:
@@ -47,7 +47,6 @@ def hex_to_youtube_url(video_url: str) -> tuple[str, str]:
     
     hex_id = match.group(1).lower()
     try:
-        # Convert 16-char hex to 8 bytes, then to base64 (urlsafe), remove padding
         b64_id = base64.urlsafe_b64encode(bytes.fromhex(hex_id)).decode('utf-8').rstrip('=')
         return f"https://www.youtube.com/watch?v={b64_id}", hex_id
     except ValueError:
@@ -81,7 +80,6 @@ def get_existing_duplicate_keys(bq_client, table_id, ad_type):
     existing_schema_by_name = {field.name: field for field in table.schema}
     key_columns = get_hash_columns(ad_type)
     
-    # Text uses _row_hash for duplication check directly
     if ad_type == "text":
         key_columns = ["_row_hash"]
 
@@ -135,6 +133,14 @@ def load_dataframe_to_bigquery(bq_client, df, project_id, dataset_id, table_name
     bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
     print(f"Appended {len(df)} new rows into {table_id}")
 
+# NEW: Helper function to get the numeric Sheet ID needed for deletion
+def get_sheet_id_by_name(sheets_service, spreadsheet_id, tab_name):
+    sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    for sheet in sheet_metadata.get('sheets', []):
+        if sheet['properties']['title'] == tab_name:
+            return sheet['properties']['sheetId']
+    raise ValueError(f"Tab '{tab_name}' not found.")
+
 def main():
     project_id = required_env("GCP_PROJECT_ID")
     dataset_id = required_env("BQ_DATASET")
@@ -153,41 +159,32 @@ def main():
     
     values = response.get("values", [])
     if not values or len(values) < 2:
-        print("No data found.")
+        print("No data found to process.")
         return
 
     headers = [str(h).strip().lower() for h in values[0]]
     df = pd.DataFrame(values[1:], columns=headers[:len(values[1])])
     
-    # Ensure all required source columns exist
     required_cols = ["package_name", "video_url", "image_url", "headline", "description", "advertiser_name", "ad_type"]
     for col in required_cols:
         if col not in df.columns:
             df[col] = ""
 
-    # Generate row numbers for hashing
     df["_source_row_number"] = range(2, len(df) + 2)
     
-    # Perform core mappings
     df["advertiser"] = df["advertiser_name"]
     df["name"] = df["package_name"]
     df["app_link"] = df["package_name"].apply(
         lambda x: f"https://play.google.com/store/apps/details?id={x}" if str(x).strip() else ""
     )
     
-    # Parse video URLs
     yt_data = df["video_url"].apply(hex_to_youtube_url)
     df["youtube_url"] = [x[0] for x in yt_data]
-    df["_ad_type_raw"] = [x[1] for x in yt_data] # Store the hex ID for video deduplication
-    
-    # Standardize ad type
+    df["_ad_type_raw"] = [x[1] for x in yt_data]
     df["_ad_type"] = df["ad_type"].str.strip().str.lower()
-    
-    # Set blank columns
     df["claim_time"] = ""
     df["views"] = ""
     
-    # Metadata columns
     df["_source_spreadsheet_id"] = spreadsheet_id
     df["_source_tab"] = tab_name
     df["_loaded_at_utc"] = datetime.now(timezone.utc)
@@ -197,23 +194,19 @@ def main():
         if filtered_df.empty:
             continue
             
-        # Select specific columns based on ad type
         selected_cols = SELECTED_COLUMNS_BY_AD_TYPE[ad_type]
         hash_columns = get_hash_columns(ad_type)
-        
         filtered_df["_row_hash"] = filtered_df.apply(lambda row: make_row_hash(row, hash_columns), axis=1)
         
         final_cols = selected_cols + METADATA_COLUMNS
         final_df = filtered_df[final_cols].copy()
         
-        # Enforce types
         for col in selected_cols + [c for c in METADATA_COLUMNS if c not in ["_source_row_number", "_loaded_at_utc"]]:
             final_df[col] = final_df[col].astype(str).replace("nan", "")
             
         final_df["_source_row_number"] = pd.to_numeric(final_df["_source_row_number"], errors="coerce").astype("Int64")
         final_df["_loaded_at_utc"] = pd.to_datetime(final_df["_loaded_at_utc"], errors="coerce", utc=True)
 
-        # Build schema dynamically
         schema = []
         for col in final_df.columns:
             if col == "_loaded_at_utc":
@@ -232,6 +225,30 @@ def main():
             schema=schema,
             ad_type=ad_type,
         )
+
+    # NEW: Delete the processed rows from the Google Sheet
+    print("All data successfully pushed to BigQuery. Deleting processed rows from the Google Sheet...")
+    sheet_id = get_sheet_id_by_name(sheets_service, spreadsheet_id, tab_name)
+    
+    # We delete from index 1 (row 2) down to the exact number of rows we originally read
+    # This ensures we don't accidentally delete rows that were added while the script was running.
+    delete_request = {
+        "deleteDimension": {
+            "range": {
+                "sheetId": sheet_id,
+                "dimension": "ROWS",
+                "startIndex": 1, 
+                "endIndex": len(values)
+            }
+        }
+    }
+    
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [delete_request]}
+    ).execute()
+    
+    print(f"Successfully deleted rows 2 through {len(values)} from '{tab_name}'.")
 
 if __name__ == "__main__":
     main()

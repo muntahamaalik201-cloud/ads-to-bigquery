@@ -4,3 +4,4 @@ google-cloud-bigquery
 pandas
 pyarrow
 pandas-gbq
+supabase

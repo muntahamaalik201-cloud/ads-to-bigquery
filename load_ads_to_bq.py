@@ -62,14 +62,23 @@ def get_hash_columns(ad_type: str) -> list[str]:
         return ["image_url"]
     if ad_type == "video":
         return ["advertiser", "_ad_type_raw"]
+    # NEW: Text ads now hash based on their actual content
+    if ad_type == "text":
+        return ["advertiser", "headline", "description"]
+    
     return ["_source_spreadsheet_id", "_source_tab", "_source_row_number", "_ad_type_raw", "_ad_type"]
 
 def make_current_duplicate_key(row, ad_type: str):
     def clean(val): return str(val or "").strip().lower()
+    
     if ad_type == "image":
         return (clean(row.get("image_url", "")),)
     if ad_type == "video":
         return (clean(row.get("advertiser", "")), clean(row.get("_ad_type_raw", "")))
+    # NEW: Text ads duplicate key uses content instead of _row_hash
+    if ad_type == "text":
+        return (clean(row.get("advertiser", "")), clean(row.get("headline", "")), clean(row.get("description", "")))
+        
     return (clean(row.get("_row_hash", "")),)
 
 def get_existing_duplicate_keys(bq_client, table_id, ad_type):
@@ -81,8 +90,9 @@ def get_existing_duplicate_keys(bq_client, table_id, ad_type):
     existing_schema_by_name = {field.name: field for field in table.schema}
     key_columns = get_hash_columns(ad_type)
     
-    if ad_type == "text":
-        key_columns = ["_row_hash"]
+    # REMOVE OR COMMENT OUT the old text override:
+    # if ad_type == "text":
+    #     key_columns = ["_row_hash"]
 
     selected_fields = [existing_schema_by_name[col] for col in key_columns if col in existing_schema_by_name]
     if len(selected_fields) != len(key_columns):
@@ -95,7 +105,6 @@ def get_existing_duplicate_keys(bq_client, table_id, ad_type):
         if any(values):
             existing_keys.add(values)
     return existing_keys
-
 def ensure_table_exists_and_schema(bq_client, table_id, schema):
     try:
         table = bq_client.get_table(table_id)

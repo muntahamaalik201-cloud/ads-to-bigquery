@@ -1,9 +1,8 @@
 name: Ads Pipeline to BigQuery and Supabase
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 7,10 * * *'
+  workflow_dispatch
+
 
 jobs:
   run:

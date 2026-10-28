@@ -178,7 +178,13 @@ def load_dataframe_to_supabase(supabase_client: Client, df: pd.DataFrame, table_
         print(f"Appended {len(records)} new rows into Supabase table {table_name}")
     except Exception as e:
         print(f"Error inserting into Supabase table {table_name}: {e}")
-
+def build_app_link(package_name):
+    pkg_str = str(package_name).strip()
+    if not pkg_str:
+        return ""
+    if pkg_str.startswith("id"):
+        return f"https://apps.apple.com/us/app/{pkg_str}"
+    return f"https://play.google.com/store/apps/details?id={pkg_str}"
 def main():
     project_id = required_env("GCP_PROJECT_ID")
     dataset_id = required_env("BQ_DATASET")
@@ -215,9 +221,7 @@ def main():
     
     df["advertiser"] = df["advertiser_name"]
     df["name"] = df["package_name"]
-    df["app_link"] = df["package_name"].apply(
-        lambda x: f"https://play.google.com/store/apps/details?id={x}" if str(x).strip() else ""
-    )
+    df["app_link"] = df["package_name"].apply(build_app_link)
     
     yt_data = df["video_url"].apply(hex_to_youtube_url)
     df["youtube_url"] = [x[0] for x in yt_data]
